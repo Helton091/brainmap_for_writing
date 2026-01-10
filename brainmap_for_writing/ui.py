@@ -4,16 +4,31 @@ import html
 from dataclasses import dataclass
 from datetime import date, datetime
 from math import atan2, cos, sin
-from typing import Optional
+from typing import Callable, Optional
 
-from PySide6.QtCore import QLineF, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QFont, QKeySequence, QPainter, QPainterPath, QPen, QPolygonF
+from pathlib import Path
+
+from PySide6.QtCore import QLineF, QPointF, QRectF, Qt, Signal, QUrl
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QKeySequence,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPolygonF,
+)
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QColorDialog,
     QDockWidget,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGraphicsItem,
@@ -23,6 +38,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QHBoxLayout,
     QInputDialog,
+    QLabel,
     QLineEdit,
     QMainWindow,
     QMenu,
@@ -33,12 +49,15 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTextEdit,
     QToolBar,
+    QToolButton,
     QToolTip,
     QVBoxLayout,
     QWidget,
 )
 
-from .core import Edge, EdgeId, Graph, Node, NodeId
+from .core import Edge, EdgeId, Graph, Node, NodeId, build_ai_friendly_prompt
+from .edit_ops import DeleteSnapshot, delete_nodes_and_edges, undo_delete
+from .edge_geometry import compute_parallel_edge_indices, curve_step
 from .importer import ImportErrorDetail, import_txt_file
 from .layout import assign_default_layout, assign_default_layout_for_new_nodes
 from .persistence import load_project, save_project
@@ -50,6 +69,7 @@ class UiConfig:
     node_radius: float = 14.0
     # Date display format: "date" or "datetime"
     date_display_format: str = "date"
+    edge_width: float = 2.0
 
 
 class NodeEditDialog(QDialog):
@@ -96,6 +116,50 @@ class NodeEditDialog(QDialog):
 
         text = self._text_input.toPlainText().rstrip()
         return parsed_date, text
+
+
+class DisplaySettingsDialog(QDialog):
+    def __init__(self, parent: QWidget, cfg: UiConfig) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Display Settings")
+
+        self._date_format = QComboBox(self)
+        self._date_format.addItems(["date", "datetime"])
+        if cfg.date_display_format == "datetime":
+            self._date_format.setCurrentText("datetime")
+        else:
+            self._date_format.setCurrentText("date")
+
+        self._node_radius = QDoubleSpinBox(self)
+        self._node_radius.setRange(6.0, 80.0)
+        self._node_radius.setDecimals(1)
+        self._node_radius.setValue(float(cfg.node_radius))
+
+        self._edge_width = QDoubleSpinBox(self)
+        self._edge_width.setRange(1.0, 12.0)
+        self._edge_width.setDecimals(1)
+        self._edge_width.setValue(float(cfg.edge_width))
+
+        form = QFormLayout()
+        form.addRow("Date Display", self._date_format)
+        form.addRow("Node Size", self._node_radius)
+        form.addRow("Edge Thickness", self._edge_width)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+    def get_values(self) -> tuple[str, float, float]:
+        return (
+            self._date_format.currentText(),
+            float(self._node_radius.value()),
+            float(self._edge_width.value()),
+        )
 
 
 class NodeItem(QGraphicsItem):
@@ -147,6 +211,7 @@ class NodeItem(QGraphicsItem):
         return self._cfg.node_radius
 
     def update_from_node(self, node: Node) -> None:
+        self.prepareGeometryChange()
         if node.event_date:
             if self._cfg.date_display_format == "datetime":
                 label = node.event_date.isoformat(sep=" ")
@@ -174,13 +239,21 @@ class NodeItem(QGraphicsItem):
             self._brush = QBrush(QColor(250, 250, 250))
 
         text = node.text.strip()
-        tooltip_text = text if text else "(empty)"
-        escaped = html.escape(tooltip_text)
-        self.setToolTip(
-            '<div style="width: 360px; white-space: pre-wrap;">'
-            f"{escaped}"
-            "</div>"
-        )
+        memory = (node.memory_block or "").strip()
+        story_path = (node.story_txt_path or "").strip()
+
+        parts: list[str] = []
+        if text:
+            parts.append(f"<b>Text</b><br/>{html.escape(text)}")
+        else:
+            parts.append("<b>Text</b><br/>(empty)")
+        if memory:
+            parts.append(f"<b>Memory</b><br/>{html.escape(memory)}")
+        if story_path:
+            parts.append(f"<b>Story TXT</b><br/>{html.escape(story_path)}")
+
+        inner = "<br/><br/>".join(parts)
+        self.setToolTip(f'<div style="width: 360px; white-space: pre-wrap;">{inner}</div>')
         self.update()
 
     def contextMenuEvent(self, event) -> None:
@@ -198,8 +271,9 @@ class NodeItem(QGraphicsItem):
 
 
 class EdgeItem(QGraphicsPathItem):
-    def __init__(self, edge: Edge, source_item: NodeItem, target_item: NodeItem) -> None:
+    def __init__(self, edge: Edge, source_item: NodeItem, target_item: NodeItem, cfg: UiConfig) -> None:
         super().__init__()
+        self._cfg = cfg
         self.edge_id = edge.id
         self.source_id = edge.source
         self.target_id = edge.target
@@ -207,18 +281,21 @@ class EdgeItem(QGraphicsPathItem):
         self._source_item = source_item
         self._target_item = target_item
         self.setZValue(-10)
-        self.setPen(QPen(QColor(30, 30, 30), 2.0))
+        self.setPen(QPen(QColor(30, 30, 30), float(self._cfg.edge_width)))
         self._arrow_brush = QBrush(QColor(30, 30, 30))
         self._arrow_poly = QPolygonF()
         self._toggle_center = QPointF(0, 0)
         self._toggle_radius = 11.0
         self._collapsed_label = ""
+        self._curve_index = 0
         self.setFlags(QGraphicsItem.ItemIsSelectable)
         self.update_path()
 
-    def sync_from_edge(self, edge: Edge, collapsed_label: str) -> None:
+    def sync_from_edge(self, edge: Edge, collapsed_label: str, curve_index: int) -> None:
         self._collapsed = edge.collapsed
         self._collapsed_label = collapsed_label
+        self._curve_index = curve_index
+        self.setPen(QPen(QColor(30, 30, 30), float(self._cfg.edge_width)))
         self.update_path()
 
     def update_path(self) -> None:
@@ -231,31 +308,35 @@ class EdgeItem(QGraphicsPathItem):
             return
 
         u = QPointF(base_line.dx() / base_line.length(), base_line.dy() / base_line.length())
+        n = QPointF(-u.y(), u.x())
         start_pad = self._source_item.radius() + 6.0
         end_pad = self._target_item.radius() + 8.0
         p1 = QPointF(a.x() + u.x() * start_pad, a.y() + u.y() * start_pad)
         p2 = QPointF(b.x() - u.x() * end_pad, b.y() - u.y() * end_pad)
 
-        line = QLineF(p1, p2)
-        angle = atan2(-line.dy(), line.dx())
+        mid = QPointF((p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2)
+        offset = float(self._curve_index) * curve_step(float(self._source_item.radius()), float(self._cfg.edge_width))
+        control = QPointF(mid.x() + n.x() * offset, mid.y() + n.y() * offset)
 
         toggle_t = 0.55
-        self._toggle_center = QPointF(
-            p1.x() + (p2.x() - p1.x()) * toggle_t,
-            p1.y() + (p2.y() - p1.y()) * toggle_t,
-        )
+        p01 = QPointF(p1.x() + (control.x() - p1.x()) * toggle_t, p1.y() + (control.y() - p1.y()) * toggle_t)
+        p12 = QPointF(control.x() + (p2.x() - control.x()) * toggle_t, control.y() + (p2.y() - control.y()) * toggle_t)
+        self._toggle_center = QPointF(p01.x() + (p12.x() - p01.x()) * toggle_t, p01.y() + (p12.y() - p01.y()) * toggle_t)
 
         if self._collapsed:
             self._arrow_poly = QPolygonF()
             path = QPainterPath()
             path.moveTo(p1)
-            path.lineTo(self._toggle_center)
+            path.quadTo(p01, self._toggle_center)
             self.setPath(path)
             return
 
-        arrow_size = 16.0
-        arrow_half_width = 8.0
-        tip = line.p2()
+        tangent = QPointF(p2.x() - control.x(), p2.y() - control.y())
+        angle = atan2(-tangent.y(), tangent.x())
+
+        arrow_size = max(12.0, float(self._source_item.radius()) * 1.1)
+        arrow_half_width = arrow_size * 0.5
+        tip = p2
         back = QPointF(
             tip.x() - arrow_size * cos(angle),
             tip.y() + arrow_size * sin(angle),
@@ -271,8 +352,8 @@ class EdgeItem(QGraphicsPathItem):
         self._arrow_poly = QPolygonF([tip, left, right])
 
         path = QPainterPath()
-        path.moveTo(line.p1())
-        path.lineTo(line.p2())
+        path.moveTo(p1)
+        path.quadTo(control, p2)
         self.setPath(path)
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
@@ -354,6 +435,12 @@ class EdgeItem(QGraphicsPathItem):
                 return
         super().mousePressEvent(event)
 
+    def contextMenuEvent(self, event) -> None:
+        scene = self.scene()
+        if scene is None or not hasattr(scene, "_open_edge_menu"):
+            return
+        scene._open_edge_menu(self.edge_id, event)
+
 
 class GraphScene(QGraphicsScene):
     legendChanged = Signal()
@@ -364,6 +451,7 @@ class GraphScene(QGraphicsScene):
         self._cfg = cfg
         self._node_items: dict[str, NodeItem] = {}
         self._edge_items: dict[str, EdgeItem] = {}
+        self._undo_stack: list[DeleteSnapshot] = []
         self._connect_mode = False
         self._connect_source: Optional[NodeId] = None
         self.setSceneRect(-1000000, -1000000, 2000000, 2000000)
@@ -398,6 +486,18 @@ class GraphScene(QGraphicsScene):
         clear_color_action = menu.addAction("Clear Color")
         note_action = menu.addAction("Set Note")
         clear_note_action = menu.addAction("Clear Note")
+        menu.addSeparator()
+        memory_action = menu.addAction("Set Memory Block")
+        clear_memory_action = menu.addAction("Clear Memory Block")
+        link_story_action = menu.addAction("Link Story TXT")
+        open_story_action = menu.addAction("Open Story TXT")
+        clear_story_action = menu.addAction("Clear Story TXT")
+        export_action = menu.addAction("Export")
+        menu.addSeparator()
+        delete_action = menu.addAction("Delete")
+
+        story_path = (node.story_txt_path or "").strip()
+        open_story_action.setEnabled(bool(story_path))
 
         chosen = menu.exec(event.screenPos())
         if chosen is None:
@@ -465,6 +565,131 @@ class GraphScene(QGraphicsScene):
             self.refresh_visibility()
             return
 
+        if chosen == memory_action:
+            text, ok = QInputDialog.getMultiLineText(parent, "Node Memory Block", "Memory", text=node.memory_block)
+            if not ok:
+                return
+            node.memory_block = text.rstrip()
+            item = self._node_items.get(node_id.value)
+            if item is not None:
+                item.update_from_node(node)
+            return
+
+        if chosen == clear_memory_action:
+            node.memory_block = ""
+            item = self._node_items.get(node_id.value)
+            if item is not None:
+                item.update_from_node(node)
+            return
+
+        if chosen == link_story_action:
+            path, _ = QFileDialog.getOpenFileName(parent, "Link Story TXT", "", "Text Files (*.txt);;All Files (*)")
+            if not path:
+                return
+            node.story_txt_path = path
+            item = self._node_items.get(node_id.value)
+            if item is not None:
+                item.update_from_node(node)
+            return
+
+        if chosen == open_story_action:
+            path = (node.story_txt_path or "").strip()
+            if not path:
+                return
+            p = Path(path)
+            if not p.exists():
+                QMessageBox.warning(parent, "Open Failed", f"File not found:\n{path}")
+                return
+            ok = QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+            if not ok:
+                QMessageBox.warning(parent, "Open Failed", f"Could not open file:\n{path}")
+            return
+
+        if chosen == clear_story_action:
+            node.story_txt_path = None
+            item = self._node_items.get(node_id.value)
+            if item is not None:
+                item.update_from_node(node)
+            return
+
+        if chosen == export_action:
+            content = build_ai_friendly_prompt(self._graph, node_id)
+            default_name = f"export_{node_id.value}.txt"
+            path, _ = QFileDialog.getSaveFileName(parent, "Export Prompt", default_name, "Text Files (*.txt);;All Files (*)")
+            if not path:
+                return
+            try:
+                Path(path).write_text(content, encoding="utf-8")
+            except OSError as exc:
+                QMessageBox.critical(parent, "Export Failed", str(exc))
+                return
+            QMessageBox.information(parent, "Export", "Exported.")
+            return
+
+        if chosen == delete_action:
+            self._delete_by_ids({node_id.value}, set())
+            return
+
+    def _open_edge_menu(self, edge_id: EdgeId, event) -> None:
+        parent = event.widget() if hasattr(event, "widget") else None
+        menu = QMenu(parent)
+        delete_action = menu.addAction("Delete")
+        chosen = menu.exec(event.screenPos())
+        if chosen is None:
+            return
+        if chosen == delete_action:
+            self._delete_by_ids(set(), {edge_id.value})
+
+    def _delete_selected(self) -> None:
+        node_ids: set[str] = set()
+        edge_ids: set[str] = set()
+        for item in self.selectedItems():
+            if isinstance(item, NodeItem):
+                node_ids.add(item.node_id.value)
+            elif isinstance(item, EdgeItem):
+                edge_ids.add(item.edge_id.value)
+        self._delete_by_ids(node_ids, edge_ids)
+
+    def _delete_by_ids(self, node_ids: set[str], edge_ids: set[str]) -> None:
+        snapshot = delete_nodes_and_edges(self._graph, node_ids, edge_ids)
+        if not snapshot.nodes and not snapshot.edges:
+            return
+
+        for edge in snapshot.edges:
+            edge_item = self._edge_items.pop(edge.id.value, None)
+            if edge_item is not None:
+                self.removeItem(edge_item)
+
+        for node in snapshot.nodes:
+            node_item = self._node_items.pop(node.id.value, None)
+            if node_item is not None:
+                self.removeItem(node_item)
+            if self._connect_source is not None and self._connect_source.value == node.id.value:
+                self._connect_source = None
+
+        self._undo_stack.append(snapshot)
+        self.refresh_visibility()
+        self.update()
+
+    def _undo_delete(self) -> None:
+        if not self._undo_stack:
+            return
+        snapshot = self._undo_stack.pop()
+        undo_delete(self._graph, snapshot)
+
+        for node in snapshot.nodes:
+            if node.id.value not in self._node_items:
+                self._add_node_item(node)
+
+        for edge in snapshot.edges:
+            if edge.id.value not in self._edge_items:
+                self._add_edge_item(edge)
+
+        for edge_item in self._edge_items.values():
+            edge_item.update_path()
+        self.refresh_visibility()
+        self.update()
+
     def _add_node_item(self, node: Node) -> None:
         item = NodeItem(node=node, cfg=self._cfg)
         item.setPos(node.x, node.y)
@@ -476,8 +701,10 @@ class GraphScene(QGraphicsScene):
         target_item = self._node_items.get(edge.target.value)
         if source_item is None or target_item is None:
             return
-        item = EdgeItem(edge=edge, source_item=source_item, target_item=target_item)
-        item.sync_from_edge(edge, self._edge_collapsed_label(edge))
+        curve_map = compute_parallel_edge_indices(self._graph.iter_edges())
+        curve_index = curve_map.get(edge.id.value, 0)
+        item = EdgeItem(edge=edge, source_item=source_item, target_item=target_item, cfg=self._cfg)
+        item.sync_from_edge(edge, self._edge_collapsed_label(edge), curve_index)
         self.addItem(item)
         self._edge_items[edge.id.value] = item
 
@@ -551,6 +778,7 @@ class GraphScene(QGraphicsScene):
         super().mousePressEvent(event)
 
     def refresh_visibility(self) -> None:
+        curve_map = compute_parallel_edge_indices(self._graph.iter_edges())
         visible_nodes = compute_visible_nodes(self._graph)
         for node_id, item in self._node_items.items():
             item.setVisible(node_id in visible_nodes)
@@ -564,7 +792,7 @@ class GraphScene(QGraphicsScene):
             is_visible = source_visible and (target_visible or edge.collapsed)
             item.setVisible(is_visible)
             if is_visible:
-                item.sync_from_edge(edge, self._edge_collapsed_label(edge))
+                item.sync_from_edge(edge, self._edge_collapsed_label(edge), curve_map.get(edge_id, 0))
 
     def refresh(self) -> None:
         for item in self._node_items.values():
@@ -618,17 +846,14 @@ class GraphView(QGraphicsView):
         if event.key() == Qt.Key_Delete:
             scene = self.scene()
             if isinstance(scene, GraphScene):
-                to_delete: list[str] = []
-                for item in scene.selectedItems():
-                    if isinstance(item, EdgeItem):
-                        to_delete.append(item.edge_id.value)
-                for edge_id in to_delete:
-                    scene._graph.remove_edge(EdgeId(edge_id))
-                    edge_item = scene._edge_items.pop(edge_id, None)
-                    if edge_item is not None:
-                        scene.removeItem(edge_item)
-                if to_delete:
-                    scene.refresh_visibility()
+                scene._delete_selected()
+            event.accept()
+            return
+
+        if event.matches(QKeySequence.Undo):
+            scene = self.scene()
+            if isinstance(scene, GraphScene):
+                scene._undo_delete()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -731,6 +956,109 @@ class LegendDockWidget(QDockWidget):
         self.refresh()
 
 
+class DocumentDockWidget(QDockWidget):
+    def __init__(self, title: str, parent: QWidget, getter: Callable[[Graph], str], setter: Callable[[Graph, str], None]) -> None:
+        super().__init__(title, parent)
+        self.setFeatures(QDockWidget.NoDockWidgetFeatures)
+        self._collapsed = False
+        self._graph: Optional[Graph] = None
+        self._updating = False
+        self._getter = getter
+        self._setter = setter
+        self._import_action: Optional[QAction] = None
+
+        self._title_bar = QWidget(self)
+        self._title_layout = QHBoxLayout()
+        self._title_layout.setContentsMargins(6, 0, 6, 0)
+        self._title_layout.setSpacing(6)
+        self._toggle_btn = QToolButton(self._title_bar)
+        self._toggle_btn.setArrowType(Qt.DownArrow)
+        self._toggle_btn.setText("")
+        self._toggle_btn.setCheckable(True)
+        self._toggle_btn.setChecked(True)
+        self._toggle_btn.toggled.connect(self._set_expanded)
+        self._title_layout.addWidget(self._toggle_btn)
+        self._title_label = QLabel(title, self._title_bar)
+        self._title_layout.addWidget(self._title_label, 1)
+        self._title_bar.setLayout(self._title_layout)
+        self.setTitleBarWidget(self._title_bar)
+
+        body = QWidget(self)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        self._import_btn = QPushButton("Import TXT", body)
+        self._import_btn.clicked.connect(self._trigger_import)
+        layout.addWidget(self._import_btn)
+
+        self._text = QTextEdit(body)
+        self._text.textChanged.connect(self._handle_text_changed)
+        layout.addWidget(self._text)
+
+        self._body = body
+        self.setWidget(body)
+        body.setLayout(layout)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self._collapsed = not expanded
+        self._title_label.setVisible(expanded)
+        if expanded:
+            self._toggle_btn.setText("")
+            self._toggle_btn.setArrowType(Qt.DownArrow)
+            self._toggle_btn.setFixedSize(18, 18)
+            self._title_layout.setContentsMargins(6, 0, 6, 0)
+            self._title_layout.setSpacing(6)
+            self._title_bar.setMinimumHeight(18)
+            self._title_bar.setMaximumHeight(16777215)
+        else:
+            self._toggle_btn.setArrowType(Qt.NoArrow)
+            self._toggle_btn.setText("+")
+            self._toggle_btn.setFixedSize(18, 18)
+            self._title_layout.setContentsMargins(0, 0, 0, 0)
+            self._title_layout.setSpacing(0)
+            self._title_bar.setMinimumHeight(18)
+            self._title_bar.setMaximumHeight(18)
+
+        self._body.setVisible(expanded)
+
+        bar = self.titleBarWidget()
+        bar_h = bar.sizeHint().height() if bar is not None else 24
+        if expanded:
+            self.setMinimumHeight(0)
+            self.setMaximumHeight(16777215)
+        else:
+            h = int(bar_h + 8)
+            self.setMinimumHeight(h)
+            self.setMaximumHeight(h)
+
+    def set_handlers(self, import_action: QAction) -> None:
+        self._import_action = import_action
+        self._text.setContextMenuPolicy(Qt.ActionsContextMenu)
+        self._text.addAction(import_action)
+
+    def _trigger_import(self) -> None:
+        if self._import_action is not None:
+            self._import_action.trigger()
+
+    def set_graph(self, graph: Graph) -> None:
+        self._graph = graph
+        self.refresh()
+
+    def refresh(self) -> None:
+        if self._graph is None:
+            return
+        self._updating = True
+        try:
+            self._text.setPlainText(self._getter(self._graph))
+        finally:
+            self._updating = False
+
+    def _handle_text_changed(self) -> None:
+        if self._updating or self._graph is None:
+            return
+        self._setter(self._graph, self._text.toPlainText())
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -741,6 +1069,31 @@ class MainWindow(QMainWindow):
         self._scene = GraphScene(self._graph, self._cfg)
         self._view = GraphView(self._scene)
         self.setCentralWidget(self._view)
+
+        self._import_system_prompt_action = QAction("Import TXT", self)
+        self._import_system_prompt_action.triggered.connect(self._import_system_prompt)
+        self._import_world_document_action = QAction("Import TXT", self)
+        self._import_world_document_action.triggered.connect(self._import_world_document)
+
+        self._prompt_dock = DocumentDockWidget(
+            "System Prompt",
+            self,
+            getter=lambda g: g.system_prompt,
+            setter=lambda g, s: setattr(g, "system_prompt", s),
+        )
+        self._prompt_dock.set_handlers(self._import_system_prompt_action)
+        self._prompt_dock.set_graph(self._graph)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self._prompt_dock)
+
+        self._world_dock = DocumentDockWidget(
+            "World Document",
+            self,
+            getter=lambda g: g.world_document,
+            setter=lambda g, s: setattr(g, "world_document", s),
+        )
+        self._world_dock.set_handlers(self._import_world_document_action)
+        self._world_dock.set_graph(self._graph)
+        self.splitDockWidget(self._prompt_dock, self._world_dock, Qt.Vertical)
 
         self._legend_dock = LegendDockWidget(self)
         self._legend_dock.set_graph(self._graph)
@@ -823,9 +1176,9 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
         
-        date_fmt_action = QAction("Toggle Date/Time", self)
-        date_fmt_action.triggered.connect(self._toggle_date_format)
-        tb.addAction(date_fmt_action)
+        settings_action = QAction("Display Settings", self)
+        settings_action.triggered.connect(self._open_display_settings)
+        tb.addAction(settings_action)
 
         if hasattr(self, "_legend_dock"):
             tb.addAction(self._legend_dock.toggleViewAction())
@@ -860,6 +1213,16 @@ class MainWindow(QMainWindow):
             self._cfg.date_display_format = "datetime"
         else:
             self._cfg.date_display_format = "date"
+        self._scene.refresh()
+
+    def _open_display_settings(self) -> None:
+        dialog = DisplaySettingsDialog(self, self._cfg)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        date_fmt, node_radius, edge_width = dialog.get_values()
+        self._cfg.date_display_format = date_fmt
+        self._cfg.node_radius = node_radius
+        self._cfg.edge_width = edge_width
         self._scene.refresh()
 
     def _reset_zoom(self) -> None:
@@ -984,6 +1347,41 @@ class MainWindow(QMainWindow):
         self._graph = graph
         self._scene.load_graph(self._graph)
         self._legend_dock.set_graph(self._graph)
+        self._prompt_dock.set_graph(self._graph)
+        self._world_dock.set_graph(self._graph)
+
+    def _read_text_file(self, path: str) -> str:
+        try:
+            try:
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    return f.read()
+            except UnicodeDecodeError:
+                with open(path, "r", encoding="gb18030") as f:
+                    return f.read()
+        except OSError as exc:
+            raise RuntimeError(f"Failed to read file: {path}") from exc
+
+    def _import_system_prompt(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import System Prompt", "", "Text Files (*.txt);;All Files (*)")
+        if not path:
+            return
+        try:
+            self._graph.system_prompt = self._read_text_file(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Failed", str(exc))
+            return
+        self._prompt_dock.refresh()
+
+    def _import_world_document(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import World Document", "", "Text Files (*.txt);;All Files (*)")
+        if not path:
+            return
+        try:
+            self._graph.world_document = self._read_text_file(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Failed", str(exc))
+            return
+        self._world_dock.refresh()
 
 
 def run_app() -> None:

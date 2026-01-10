@@ -35,6 +35,8 @@ class Node:
     event_date: Optional[datetime] = None
     color: Optional[str] = None
     note: str = ""
+    memory_block: str = ""
+    story_txt_path: Optional[str] = None
     x: float = 0.0
     y: float = 0.0
 
@@ -52,6 +54,8 @@ class Graph:
     nodes: dict[str, Node] = field(default_factory=dict)
     edges: dict[str, Edge] = field(default_factory=dict)
     legend: dict[str, str] = field(default_factory=dict)
+    system_prompt: str = ""
+    world_document: str = ""
 
     def add_node(self, node: Node) -> None:
         self.nodes[node.id.value] = node
@@ -79,10 +83,76 @@ class Graph:
         return self.edges.values()
 
 
+def upstream_node_ids(graph: Graph, node_id: NodeId) -> set[str]:
+    incoming: dict[str, list[str]] = {nid: [] for nid in graph.nodes.keys()}
+    for edge in graph.iter_edges():
+        t = edge.target.value
+        s = edge.source.value
+        if t in incoming and s in graph.nodes:
+            incoming[t].append(s)
+
+    visited: set[str] = set()
+    stack: list[str] = list(incoming.get(node_id.value, []))
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        stack.extend(incoming.get(cur, []))
+    return visited
+
+
+def build_ai_friendly_prompt(graph: Graph, target_node_id: NodeId) -> str:
+    target = graph.get_node(target_node_id)
+    upstream_ids = upstream_node_ids(graph, target_node_id)
+    upstream_nodes = [graph.nodes[nid] for nid in upstream_ids if nid in graph.nodes]
+
+    def sort_key(n: Node) -> tuple[int, str, str]:
+        if n.event_date is None:
+            return (1, "9999-99-99 99:99:99", n.id.value)
+        return (0, n.event_date.isoformat(sep=" "), n.id.value)
+
+    upstream_nodes.sort(key=sort_key)
+
+    lines: list[str] = []
+    lines.append("# System Prompt")
+    lines.append(graph.system_prompt.rstrip())
+    lines.append("")
+    lines.append("# World Document")
+    lines.append(graph.world_document.rstrip())
+    lines.append("")
+    lines.append("# Upstream Memory Blocks")
+    any_memory = False
+    for n in upstream_nodes:
+        mem = (n.memory_block or "").strip()
+        if not mem:
+            continue
+        any_memory = True
+        dt = n.event_date.isoformat(sep=" ") if n.event_date else "(no date)"
+        lines.append(f"## {dt} {n.id.value}")
+        lines.append(mem)
+        lines.append("")
+    if not any_memory:
+        lines.append("(none)")
+        lines.append("")
+
+    lines.append("# Target Node Text")
+    lines.append(target.text.rstrip())
+    lines.append("")
+    lines.append("# Instructions")
+    lines.append("Use the system prompt and world document as hard constraints.")
+    lines.append("Incorporate upstream memory blocks as context.")
+    lines.append("Write the story for the target node text while keeping consistency.")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def graph_to_dict(graph: Graph) -> dict[str, Any]:
     return {
         "version": 1,
         "legend": dict(graph.legend),
+        "system_prompt": graph.system_prompt,
+        "world_document": graph.world_document,
         "nodes": [
             {
                 "id": n.id.value,
@@ -90,6 +160,8 @@ def graph_to_dict(graph: Graph) -> dict[str, Any]:
                 "event_date": n.event_date.isoformat() if n.event_date else None,
                 "color": n.color,
                 "note": n.note,
+                "memory_block": n.memory_block,
+                "story_txt_path": n.story_txt_path,
                 "x": n.x,
                 "y": n.y,
             }
@@ -117,13 +189,20 @@ def graph_from_dict(data: dict[str, Any]) -> Graph:
     raw_nodes = data.get("nodes")
     raw_edges = data.get("edges")
     raw_legend = data.get("legend", {})
+    raw_system_prompt = data.get("system_prompt", "")
+    raw_world_document = data.get("world_document", "")
     if not isinstance(raw_nodes, list) or not isinstance(raw_edges, list):
         raise ValueError("Project data must contain 'nodes' and 'edges' arrays")
 
     if not isinstance(raw_legend, dict):
         raise ValueError("Project data 'legend' must be an object")
 
-    graph = Graph()
+    if not isinstance(raw_system_prompt, str):
+        raise ValueError("Project data 'system_prompt' must be a string")
+    if not isinstance(raw_world_document, str):
+        raise ValueError("Project data 'world_document' must be a string")
+
+    graph = Graph(system_prompt=raw_system_prompt, world_document=raw_world_document)
     for k, v in raw_legend.items():
         if isinstance(k, str) and isinstance(v, str):
             graph.legend[k] = v
@@ -173,6 +252,22 @@ def graph_from_dict(data: dict[str, Any]) -> Graph:
         else:
             raise ValueError("Node 'note' must be a string")
 
+        raw_memory = raw.get("memory_block", "")
+        if raw_memory is None:
+            memory_block = ""
+        elif isinstance(raw_memory, str):
+            memory_block = raw_memory
+        else:
+            raise ValueError("Node 'memory_block' must be a string")
+
+        raw_story_path = raw.get("story_txt_path")
+        if raw_story_path is None:
+            story_txt_path: Optional[str] = None
+        elif isinstance(raw_story_path, str):
+            story_txt_path = raw_story_path
+        else:
+            raise ValueError("Node 'story_txt_path' must be a string or null")
+
         graph.add_node(
             Node(
                 id=NodeId(node_id),
@@ -180,6 +275,8 @@ def graph_from_dict(data: dict[str, Any]) -> Graph:
                 event_date=parsed_date,
                 color=color,
                 note=note,
+                memory_block=memory_block,
+                story_txt_path=story_txt_path,
                 x=float(x),
                 y=float(y),
             )

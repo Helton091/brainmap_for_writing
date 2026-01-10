@@ -2,6 +2,35 @@ from brainmap_for_writing.core import Edge, EdgeId, Graph, Node, NodeId
 from brainmap_for_writing.visibility import compute_visible_nodes
 
 
+def test_build_ai_prompt_uses_upstream_memory_and_target_text() -> None:
+    from brainmap_for_writing.core import build_ai_friendly_prompt
+
+    g = Graph()
+    g.system_prompt = "SYS"
+    g.world_document = "WORLD"
+    a = Node(id=NodeId.new(), text="A", memory_block="MA")
+    b = Node(id=NodeId.new(), text="B", memory_block="")
+    c = Node(id=NodeId.new(), text="C", memory_block="MC")
+    t = Node(id=NodeId.new(), text="TARGET")
+    g.add_node(a)
+    g.add_node(b)
+    g.add_node(c)
+    g.add_node(t)
+    g.add_edge(Edge(id=EdgeId.new(), source=a.id, target=b.id))
+    g.add_edge(Edge(id=EdgeId.new(), source=b.id, target=t.id))
+    g.add_edge(Edge(id=EdgeId.new(), source=c.id, target=t.id))
+
+    out = build_ai_friendly_prompt(g, t.id)
+    assert "# System Prompt" in out
+    assert "SYS" in out
+    assert "# World Document" in out
+    assert "WORLD" in out
+    assert "MA" in out
+    assert "MC" in out
+    assert "TARGET" in out
+    assert "##" in out
+
+
 def test_collapse_hides_downstream_chain() -> None:
     g = Graph()
     a = Node(id=NodeId.new(), text="A")

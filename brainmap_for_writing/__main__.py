@@ -1,4 +1,4 @@
-from .ui import run_app
+from brainmap_for_writing.ui import run_app
 
 
 if __name__ == "__main__":

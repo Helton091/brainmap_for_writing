@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
@@ -16,7 +16,8 @@ def test_import_txt_lines_creates_dated_nodes() -> None:
     graph = import_txt_lines(lines)
     dated = [n for n in graph.iter_nodes() if n.event_date is not None]
     assert len(dated) == 2
-    assert {n.event_date for n in dated} == {date(2200, 7, 10), date(2200, 8, 3)}
+    assert all(isinstance(n.event_date, datetime) for n in dated)
+    assert {n.event_date.date() for n in dated if n.event_date is not None} == {date(2200, 7, 10), date(2200, 8, 3)}
 
 
 def test_import_txt_lines_supports_single_digit_month_day() -> None:
@@ -28,7 +29,8 @@ def test_import_txt_lines_supports_single_digit_month_day() -> None:
     ]
     graph = import_txt_lines(lines)
     dated = [n for n in graph.iter_nodes() if n.event_date is not None]
-    assert {n.event_date for n in dated} == {date(2200, 7, 1), date(2200, 8, 3)}
+    assert all(isinstance(n.event_date, datetime) for n in dated)
+    assert {n.event_date.date() for n in dated if n.event_date is not None} == {date(2200, 7, 1), date(2200, 8, 3)}
 
 
 def test_import_txt_lines_creates_undated_blocks_split_by_blank_lines() -> None:
